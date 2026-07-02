@@ -302,7 +302,11 @@ def design_borefield_configuration(
 
     starts = []
     for n_1s, n_2s, hs in ((n_1_max, n_2_max, h_min), (max(1., n_1_max / 4), max(1., n_2_max / 4), h_max),
-                           (max(1., n_1_max / 2), max(1., n_2_max / 2), 0.5 * (h_min + h_max))):
+                           (max(1., n_1_max / 2), max(1., n_2_max / 2), 0.5 * (h_min + h_max)),
+                           # line and boundary configurations form separate basins
+                           (1., n_2_max, h_max), (n_1_max, 1., h_max),
+                           (n_1_max, max(1., n_2_max / 3), 0.5 * (h_min + h_max)),
+                           (max(1., n_1_max / 3), n_2_max, 0.5 * (h_min + h_max))):
         starts.append([n_1s, n_2s, _spacing_for(n_1s, l_1_max, b_min, b_max),
                        _spacing_for(n_2s, l_2_max, b_min, b_max), hs])
 
@@ -357,6 +361,30 @@ def design_borefield_configuration(
             for dn_2 in (0, 1, -1):
                 candidates.add((int(np.floor(x[0])) + dn_1, int(np.floor(x[1])) + dn_2))
                 candidates.add((int(np.ceil(x[0])) + dn_1, int(np.ceil(x[1])) + dn_2))
+
+    # the 1D boundary families of the integer lattice (single and double rows and
+    # the plot-filling edges) are separate basins that the integer hill-climb cannot
+    # reach from a block optimum: scan them with the cheap surrogate and add the
+    # most promising members as candidates
+    for family in ('n1', 'n2'):
+        boundary = (1, 2, n_1_max, n_1_max - 1) if family == 'n1' else (1, 2, n_2_max, n_2_max - 1)
+        for n_fixed in {max(n, 1) for n in boundary}:
+            best_family = None
+            n_free_max = n_2_max if family == 'n1' else n_1_max
+            for n in range(1, n_free_max + 1):
+                n_1, n_2 = (n_fixed, n) if family == 'n1' else (n, n_fixed)
+                if not nb_min <= n_1 * n_2 <= nb_max:
+                    continue
+                b_1 = _spacing_for(n_1, l_1_max, b_min, b_max)
+                b_2 = _spacing_for(n_2, l_2_max, b_min, b_max)
+                h = surrogate.required_h(n_1, n_2, b_1, b_2, h_min, h_max)
+                if h > h_max:
+                    continue
+                c = cost(n_1, n_2, max(h, h_min))
+                if best_family is None or c < best_family[0]:
+                    best_family = (c, n_1, n_2)
+            if best_family is not None:
+                candidates.add((best_family[1], best_family[2]))
     if not candidates:
         # surrogate NLP failed: fall back to a coarse surrogate scan
         best_scan = None
