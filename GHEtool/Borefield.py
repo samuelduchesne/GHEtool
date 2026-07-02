@@ -14,7 +14,8 @@ import numpy as np
 import pygfunction as gt
 
 from numpy.typing import ArrayLike
-from scipy.signal import convolve
+from scipy.signal import choose_conv_method, convolve
+from scipy import fft as sp_fft
 
 from GHEtool.VariableClasses import FluidData, Borehole, GroundConstantTemperature, ResultsMonthly, ResultsHourly, \
     TemperatureDependentFluidData, SCOP, SEER
@@ -126,6 +127,46 @@ class Borefield(BaseClass):
 
         # temporary results
         self._temp_results = {}
+
+        # cache with the FFT of the convolution kernel (the g-value differences),
+        # which is reused over the iterations of the temperature calculation
+        self._kernel_fft_cache = {}
+
+    def _convolve_with_kernel(self, signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        """
+        This function convolves ('full' mode) the signal with the kernel, like
+        scipy.signal.convolve does, but it caches the FFT of the kernel. During the
+        iterative temperature calculations, the same kernel (the g-value differences)
+        is convolved over and over, so reusing its FFT saves time. The result is
+        identical to scipy.signal.convolve.
+
+        Parameters
+        ----------
+        signal : np.ndarray
+            1D array with the load values [W]
+        kernel : np.ndarray
+            1D array with the g-value differences
+
+        Returns
+        -------
+        result : np.ndarray
+            The full convolution of signal and kernel
+        """
+        if len(signal) == 0 or len(kernel) == 0 or signal.ndim != 1 or kernel.ndim != 1 \
+                or choose_conv_method(signal, kernel) != 'fft':
+            return convolve(signal, kernel)
+
+        # same shape logic as scipy.signal.fftconvolve for 1D real inputs
+        shape = len(signal) + len(kernel) - 1
+        fshape = sp_fft.next_fast_len(shape, True)
+        entry = self._kernel_fft_cache.get(fshape)
+        if entry is None or entry[0] is not kernel:
+            if len(self._kernel_fft_cache) >= 8:
+                self._kernel_fft_cache.clear()
+            entry = (kernel, sp_fft.rfft(kernel, fshape))
+            self._kernel_fft_cache[fshape] = entry
+        sp1 = sp_fft.rfft(signal, fshape)
+        return sp_fft.irfft(sp1 * entry[1], fshape)[:shape].copy()
 
     @property
     def number_of_boreholes(self) -> int:
@@ -1912,6 +1953,8 @@ class Borefield(BaseClass):
             # set Rb* value
             H_var = H if H is not None else self.H
             depth = self.calculate_depth(H_var, self.D)
+            # hoisted, since for multiyear loads every access recomputes the load arrays
+            load_simulation_period = self.load.simulation_period
 
             results = None
 
@@ -1924,7 +1967,7 @@ class Borefield(BaseClass):
                                                         depth,
                                                         temperature=Tmin, nb_of_boreholes=self.number_of_boreholes,
                                                         use_explicit_models=self._calculation_setup.use_explicit_multipole,
-                                                        simulation_period=self.load.simulation_period,
+                                                        simulation_period=load_simulation_period,
                                                         power=power)
                         elif limit == (Tmax if Tmax is not None else self.Tf_max):
                             return self.borehole.get_Rb(H_var, self.D, self.r_b, self.ground_data.k_s(depth, self.D),
@@ -1932,7 +1975,7 @@ class Borefield(BaseClass):
                                                         temperature=max(temperature),
                                                         nb_of_boreholes=self.number_of_boreholes,
                                                         use_explicit_models=self._calculation_setup.use_explicit_multipole,
-                                                        simulation_period=self.load.simulation_period,
+                                                        simulation_period=load_simulation_period,
                                                         power=power)
                         else:
                             return self.borehole.get_Rb(H_var, self.D, self.r_b, self.ground_data.k_s(depth, self.D),
@@ -1940,19 +1983,19 @@ class Borefield(BaseClass):
                                                         temperature=min(temperature),
                                                         nb_of_boreholes=self.number_of_boreholes,
                                                         use_explicit_models=self._calculation_setup.use_explicit_multipole,
-                                                        simulation_period=self.load.simulation_period,
+                                                        simulation_period=load_simulation_period,
                                                         power=power)
                 if len(temperature) == 0:
                     return self.borehole.get_Rb(H_var, self.D, self.r_b, self.ground_data.k_s(depth, self.D), depth,
                                                 temperature=Tmin, nb_of_boreholes=self.number_of_boreholes,
                                                 use_explicit_models=self._calculation_setup.use_explicit_multipole,
-                                                simulation_period=self.load.simulation_period,
+                                                simulation_period=load_simulation_period,
                                                 power=power)
 
                 return self.borehole.get_Rb(H_var, self.D, self.r_b, self.ground_data.k_s(depth, self.D), depth,
                                             temperature=temperature, nb_of_boreholes=self.number_of_boreholes,
                                             use_explicit_models=self._calculation_setup.use_explicit_multipole,
-                                            simulation_period=self.load.simulation_period,
+                                            simulation_period=load_simulation_period,
                                             power=power)
 
             if not hourly:
@@ -1961,8 +2004,16 @@ class Borefield(BaseClass):
                     raise ValueError(
                         'No monthly temperature profile can be calculated when an hourly flow rate is given.')
 
+                # the load properties are hoisted into local variables, since every
+                # access recomputes them (which is expensive for building loads)
+                monthly_average_injection_power = self.load.monthly_average_injection_power_simulation_period
+                monthly_peak_injection = self.load.monthly_peak_injection_simulation_period
+                monthly_peak_extraction = self.load.monthly_peak_extraction_simulation_period
+                monthly_baseload_injection_power = self.load.monthly_baseload_injection_power_simulation_period
+                monthly_baseload_extraction_power = self.load.monthly_baseload_extraction_power_simulation_period
+
                 # convolution to get the monthly results
-                result_convolution = convolve(self.load.monthly_average_injection_power_simulation_period * 1000,
+                result_convolution = convolve(monthly_average_injection_power * 1000,
                                               g_value_differences)[: 12 * self.simulation_period]
 
                 # calculation the borehole wall temperature for every month i
@@ -1972,45 +2023,45 @@ class Borefield(BaseClass):
 
                 # now the Tf will be calculated based on
                 # Tf = Tb + Q * R_b
-                power = np.where(self.load.monthly_average_injection_power_simulation_period > 0,
-                                 self.load.monthly_peak_injection_simulation_period,
-                                 self.load.monthly_peak_extraction_simulation_period)
-                results_month_avg = Tb + self.load.monthly_average_injection_power_simulation_period * 1000 * (
+                power = np.where(monthly_average_injection_power > 0,
+                                 monthly_peak_injection,
+                                 monthly_peak_extraction)
+                results_month_avg = Tb + monthly_average_injection_power * 1000 * (
                         get_rb(results_temperature.baseload_temperature, Tmin,
                                power=power) / self.number_of_boreholes / H_var)
 
                 # extra summation if the g-function value for the peak is included
                 results_peak_injection = (
                         Tb
-                        + (self.load.monthly_peak_injection_simulation_period
+                        + (monthly_peak_injection
                            * (g_value_peak_injection / k_s / 2 / pi + get_rb(results_temperature.peak_injection, Tmax,
-                                                                             self.load.monthly_peak_injection_simulation_period))
-                           - self.load.monthly_average_injection_power_simulation_period * g_value_peak_injection / k_s / 2 / pi)
+                                                                             monthly_peak_injection))
+                           - monthly_average_injection_power * g_value_peak_injection / k_s / 2 / pi)
                         * 1000 / self.number_of_boreholes / H_var
                 )
-                results_peak_injection[self.load.monthly_peak_injection_simulation_period == 0] = Tb[
-                    self.load.monthly_peak_injection_simulation_period == 0]
+                results_peak_injection[monthly_peak_injection == 0] = Tb[
+                    monthly_peak_injection == 0]
 
                 results_peak_extraction = (
                         Tb +
-                        (- self.load.monthly_peak_extraction_simulation_period
+                        (- monthly_peak_extraction
                          * (g_value_peak_extraction / k_s / 2 / pi + get_rb(results_temperature.peak_extraction, Tmin,
-                                                                            self.load.monthly_peak_extraction_simulation_period * (
+                                                                            monthly_peak_extraction * (
                                                                                 -1)))
-                         - self.load.monthly_average_injection_power_simulation_period * g_value_peak_extraction / k_s / 2 / pi)
+                         - monthly_average_injection_power * g_value_peak_extraction / k_s / 2 / pi)
                         * 1000 / self.number_of_boreholes / H_var
                 )
 
-                results_peak_extraction[self.load.monthly_peak_extraction_simulation_period == 0] = Tb[
-                    self.load.monthly_peak_extraction_simulation_period == 0]
+                results_peak_extraction[monthly_peak_extraction == 0] = Tb[
+                    monthly_peak_extraction == 0]
 
                 # these results will be depreciated in v2.5.0
-                results_month_injection = Tb + self.load.monthly_baseload_injection_power_simulation_period * 1000 * (
+                results_month_injection = Tb + monthly_baseload_injection_power * 1000 * (
                         get_rb(results_temperature.monthly_injection, Tmax,
-                               self.load.monthly_baseload_injection_power_simulation_period) / self.number_of_boreholes / H_var)
-                results_month_extraction = Tb - self.load.monthly_baseload_extraction_power_simulation_period * 1000 * (
+                               monthly_baseload_injection_power) / self.number_of_boreholes / H_var)
+                results_month_extraction = Tb - monthly_baseload_extraction_power * 1000 * (
                         get_rb(results_temperature.monthly_extraction, Tmin,
-                               self.load.monthly_baseload_extraction_power_simulation_period) / self.number_of_boreholes / H_var)
+                               monthly_baseload_extraction_power) / self.number_of_boreholes / H_var)
 
                 # save temperatures under variable
                 results = ResultsMonthly(
@@ -2025,12 +2076,12 @@ class Borefield(BaseClass):
                 # calculate inlet/outlet temperatures when possible
                 if not self.borehole.use_constant_Rb:
                     results._baseload_temp_inlet, results._baseload_temp_outlet = self.calculate_borefield_inlet_outlet_temperature(
-                        self.load.monthly_average_injection_power_simulation_period, results.baseload_temperature)
+                        monthly_average_injection_power, results.baseload_temperature)
                     results._peak_injection_inlet, results._peak_injection_outlet = self.calculate_borefield_inlet_outlet_temperature(
-                        self.load.monthly_peak_injection_simulation_period, results.peak_injection)
+                        monthly_peak_injection, results.peak_injection)
                     # (-1) needed since the peak power is always defined positive but for the Delta T it should be signed
                     results._peak_extraction_inlet, results._peak_extraction_outlet = self.calculate_borefield_inlet_outlet_temperature(
-                        (-1) * self.load.monthly_peak_extraction_simulation_period, results.peak_extraction)
+                        (-1) * monthly_peak_extraction, results.peak_extraction)
             if hourly:
                 # check for hourly data if this is requested
                 if not self.load._hourly:
@@ -2043,8 +2094,8 @@ class Borefield(BaseClass):
                     # convolution to get the hourly results
                     result_convolution = np.zeros_like(hourly_load, dtype=float)
 
-                    result_convolution[:max_idx + 1] = convolve(hourly_load[:max_idx + 1] * 1000, g_value_differences)[
-                        :max_idx + 1]
+                    result_convolution[:max_idx + 1] = self._convolve_with_kernel(
+                        hourly_load[:max_idx + 1] * 1000, g_value_differences)[:max_idx + 1]
 
                     self._temp_results['result_convolution'] = result_convolution
                     self._temp_results['hourly_load_prev'] = hourly_load.copy()
@@ -2065,7 +2116,7 @@ class Borefield(BaseClass):
                             first_idx:max_idx + 1]) * 1000
                         if len(delta) == 0:  # pragma: no cover
                             pass
-                        update = convolve(delta, g_value_differences)
+                        update = self._convolve_with_kernel(delta, g_value_differences)
 
                         self._temp_results['result_convolution'][first_idx:max_idx + 1] += update[
                             :max_idx - first_idx + 1]
@@ -2108,10 +2159,10 @@ class Borefield(BaseClass):
                                    hourly_load) / self.number_of_boreholes / H_var)
                 if not self.borehole.use_constant_Rb:
                     results._Tf_inlet, results._Tf_outlet = self.calculate_borefield_inlet_outlet_temperature(
-                        hourly_load, results.peak_injection, simulation_period=self.load.simulation_period)
+                        hourly_load, results.peak_injection, simulation_period=load_simulation_period)
                     if sizing:
                         results._Tf_extraction_inlet, results._Tf_extraction_outlet = self.calculate_borefield_inlet_outlet_temperature(
-                            hourly_load, results._Tf_extraction, simulation_period=self.load.simulation_period)
+                            hourly_load, results._Tf_extraction, simulation_period=load_simulation_period)
             return results
 
         def calculate_difference(

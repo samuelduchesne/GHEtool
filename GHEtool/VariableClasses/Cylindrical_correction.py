@@ -10,13 +10,326 @@ import numpy as np
 from pygfunction.boreholes import Borehole, _EquivalentBorehole, find_duplicates
 from pygfunction.heat_transfer import finite_line_source, finite_line_source_vectorized, \
     finite_line_source_equivalent_boreholes_vectorized
+from pygfunction.heat_transfer import _finite_line_source_integrand as _finite_line_source_integrand_pygf
+from pygfunction.heat_transfer import \
+    _finite_line_source_equivalent_boreholes_integrand as _finite_line_source_equivalent_boreholes_integrand_pygf
 from pygfunction.networks import network_thermal_resistance
 
 from scipy.integrate import quad_vec
-from scipy.special import j0, j1, y0, y1
+from scipy.special import erf, j0, j1, y0, y1
 
 from scipy.interpolate import interp1d as interp1d
 from time import perf_counter
+
+# Gauss-Kronrod 21 nodes and weights (same tables as scipy.integrate.quad_vec)
+_GK21_NODES = np.array([
+    0.995657163025808080735527280689003, 0.973906528517171720077964012084452,
+    0.930157491355708226001207180059508, 0.865063366688984510732096688423493,
+    0.780817726586416897063717578345042, 0.679409568299024406234327365114874,
+    0.562757134668604683339000099272694, 0.433395394129247190799265943165784,
+    0.294392862701460198131126603103866, 0.148874338981631210884826001129720,
+    0.,
+    -0.148874338981631210884826001129720, -0.294392862701460198131126603103866,
+    -0.433395394129247190799265943165784, -0.562757134668604683339000099272694,
+    -0.679409568299024406234327365114874, -0.780817726586416897063717578345042,
+    -0.865063366688984510732096688423493, -0.930157491355708226001207180059508,
+    -0.973906528517171720077964012084452, -0.995657163025808080735527280689003])
+_GK21_WEIGHTS_GAUSS = np.array([
+    0.066671344308688137593568809893332, 0.149451349150580593145776339657697,
+    0.219086362515982043995534934228163, 0.269266719309996355091226921569469,
+    0.295524224714752870173892994651338, 0.295524224714752870173892994651338,
+    0.269266719309996355091226921569469, 0.219086362515982043995534934228163,
+    0.149451349150580593145776339657697, 0.066671344308688137593568809893332])
+_GK21_WEIGHTS_KRONROD = np.array([
+    0.011694638867371874278064396062192, 0.032558162307964727478818972459390,
+    0.054755896574351996031381300244580, 0.075039674810919952767043140916190,
+    0.093125454583697605535065465083366, 0.109387158802297641899210590325805,
+    0.123491976262065851077958109831074, 0.134709217311473325928054001771707,
+    0.142775938577060080797094273138717, 0.147739104901338491374841515972068,
+    0.149445554002916905664936468389821,
+    0.147739104901338491374841515972068, 0.142775938577060080797094273138717,
+    0.134709217311473325928054001771707, 0.123491976262065851077958109831074,
+    0.109387158802297641899210590325805, 0.093125454583697605535065465083366,
+    0.075039674810919952767043140916190, 0.054755896574351996031381300244580,
+    0.032558162307964727478818972459390, 0.011694638867371874278064396062192])
+
+
+def _erfint(x):
+    """Integral of the error function (identical to pygfunction.utilities.erfint)."""
+    return x * erf(x) - 1.0 / np.sqrt(np.pi) * (1.0 - np.exp(-x ** 2))
+
+
+def _gk21_evaluate(f_batched, x1, x2):
+    """
+    Evaluate the Gauss-Kronrod 21 rule on a batch of subintervals in a single
+    vectorized integrand call. Uses the same nodes, weights and error model as
+    scipy.integrate.quad_vec's _quadrature_gk21.
+
+    Parameters
+    ----------
+    f_batched : callable
+        Function taking a 1D array of quadrature points (shape (n,)) and returning
+        the integrand evaluated at all points, with the point axis first
+        (shape (n, ...)).
+    x1, x2 : np.ndarray
+        1D arrays with the subinterval bounds.
+
+    Returns
+    -------
+    integrals : np.ndarray
+        Integral estimates, shape (len(x1), ...).
+    err : np.ndarray
+        Error estimates (2-norm over the payload), shape (len(x1),).
+    """
+    eps = np.finfo(np.float64).eps
+    m = len(x1)
+    c = 0.5 * (x1 + x2)
+    h = 0.5 * (x2 - x1)
+    nodes = c[:, None] + h[:, None] * _GK21_NODES[None, :]
+    ff = f_batched(nodes.reshape(-1))
+    payload_shape = ff.shape[1:]
+    ff = ff.reshape((m, 21) + payload_shape)
+    payload_axes = tuple(range(1, 1 + len(payload_shape)))
+
+    s_k = np.einsum('j,mj...->m...', _GK21_WEIGHTS_KRONROD, ff)
+    s_g = np.einsum('j,mj...->m...', _GK21_WEIGHTS_GAUSS, ff[:, 1::2])
+    s_k_abs = np.einsum('j,mj...->m...', _GK21_WEIGHTS_KRONROD, np.abs(ff))
+    y0 = s_k / 2.0
+    s_k_dabs = np.einsum('j,mj...->m...', _GK21_WEIGHTS_KRONROD,
+                         np.abs(ff - y0[:, None]))
+
+    def norm(x):
+        return np.sqrt(np.sum(np.abs(x) ** 2, axis=payload_axes))
+
+    h_abs = np.abs(h)
+    err = norm(s_k - s_g) * h_abs
+    dabs = norm(s_k_dabs) * h_abs
+    mask = (dabs != 0) & (err != 0)
+    err[mask] = dabs[mask] * np.minimum(1.0, (200 * err[mask] / dabs[mask]) ** 1.5)
+    round_err = norm(50 * eps * s_k_abs) * h_abs
+    err = np.where(round_err > np.finfo(np.float64).tiny, np.maximum(err, round_err), err)
+    integrals = h[(slice(None),) + (None,) * len(payload_shape)] * s_k
+    return integrals, err
+
+
+def _adaptive_gk21_batched(f_batched, a, b, epsabs=1e-200, epsrel=1e-8, max_rounds=60):
+    """
+    Adaptive Gauss-Kronrod 21 integration of a vector-valued integrand over many
+    independent finite intervals at once.
+
+    This applies the same GK21 rule, error model, tolerances and worst-first
+    bisection strategy as ``scipy.integrate.quad_vec`` (the integrator pygfunction
+    uses for the finite line source solution), but evaluates the integrand for the
+    quadrature nodes of all intervals that still need refinement in a single
+    vectorized call per round. This removes the per-node Python and numpy-dispatch
+    overhead without changing the quadrature rule, the error estimate or the
+    convergence criterion, so the achieved integration accuracy is the same as with
+    quad_vec.
+
+    Parameters
+    ----------
+    f_batched : callable
+        Function taking a 1D array of quadrature points s (shape (n,)) and returning
+        the integrand evaluated at all points, with the point axis first
+        (shape (n, ...)).
+    a, b : np.ndarray
+        1D arrays with the (finite) integration bounds per interval.
+    epsabs : float
+        Absolute tolerance (same default as scipy.integrate.quad_vec).
+    epsrel : float
+        Relative tolerance (same default as scipy.integrate.quad_vec).
+    max_rounds : int
+        Maximum number of subdivision rounds.
+
+    Returns
+    -------
+    result : np.ndarray
+        Array of shape (len(a), ...) with the integrals for every interval.
+    """
+    n_intervals = len(a)
+
+    # state of all current subintervals
+    idx = np.arange(n_intervals)
+    x1 = np.asarray(a, dtype=np.float64).copy()
+    x2 = np.asarray(b, dtype=np.float64).copy()
+    integrals, err = _gk21_evaluate(f_batched, x1, x2)
+    payload_shape = integrals.shape[1:]
+    payload_axes = tuple(range(1, 1 + len(payload_shape)))
+
+    for _ in range(max_rounds):
+        # aggregate per original interval
+        total = np.zeros((n_intervals,) + payload_shape)
+        np.add.at(total, idx, integrals)
+        err_total = np.zeros(n_intervals)
+        np.add.at(err_total, idx, err)
+
+        tol = np.maximum(epsabs, epsrel * np.sqrt(np.sum(total ** 2, axis=payload_axes)))
+        interval_converged = err_total <= tol
+        pending = ~interval_converged[idx]
+        if not np.any(pending):
+            return total
+
+        # per unconverged interval, bisect its worst subinterval (worst-first,
+        # like scipy's quad_vec with workers=1)
+        idx_p = idx[pending]
+        err_p = err[pending]
+        order = np.lexsort((-err_p, idx_p))
+        idx_sorted = idx_p[order]
+        first_of_group = np.ones(len(idx_sorted), dtype=bool)
+        first_of_group[1:] = idx_sorted[1:] != idx_sorted[:-1]
+        worst_local = order[first_of_group]
+        worst = np.where(pending)[0][worst_local]
+
+        x1_w, x2_w = x1[worst], x2[worst]
+        mid = 0.5 * (x1_w + x2_w)
+        splittable = (mid > x1_w) & (mid < x2_w)
+        if not np.any(splittable):
+            return total
+        worst = worst[splittable]
+        x1_w, x2_w, mid = x1_w[splittable], x2_w[splittable], mid[splittable]
+
+        # evaluate the two halves of every bisected subinterval
+        new_x1 = np.concatenate([x1_w, mid])
+        new_x2 = np.concatenate([mid, x2_w])
+        new_idx = np.concatenate([idx[worst], idx[worst]])
+        new_integrals, new_err = _gk21_evaluate(f_batched, new_x1, new_x2)
+
+        # replace the bisected subintervals with their halves
+        keep = np.ones(len(idx), dtype=bool)
+        keep[worst] = False
+        idx = np.concatenate([idx[keep], new_idx])
+        x1 = np.concatenate([x1[keep], new_x1])
+        x2 = np.concatenate([x2[keep], new_x2])
+        integrals = np.concatenate([integrals[keep], new_integrals])
+        err = np.concatenate([err[keep], new_err])
+
+    total = np.zeros((n_intervals,) + payload_shape)
+    np.add.at(total, idx, integrals)
+    return total
+
+
+def _finite_line_source_vectorized_batched(
+        time, alpha, dis, H1, D1, H2, D2, reaSource=True, imgSource=True,
+        approximation=False, N=10):
+    """
+    Evaluate the Finite Line Source (FLS) solution for an array of time values.
+
+    This is numerically equivalent to pygfunction's
+    :func:`finite_line_source_vectorized`: it evaluates the same one-integral form
+    of the FLS solution with the same adaptive Gauss-Kronrod quadrature rule and
+    tolerances, but batches the integrand evaluations over the quadrature nodes of
+    all time intervals at once, which is considerably faster. It falls back to the
+    pygfunction implementation whenever the inputs are not of the expected form.
+    """
+    q_dim = np.ndim(D2 - D1 + H2) + 1
+    if (approximation or not (reaSource and imgSource) or np.ndim(time) == 0
+            or isinstance(time, (np.floating, float)) or len(np.atleast_1d(time)) < 2
+            or np.ndim(dis) > q_dim - 1):
+        return finite_line_source_vectorized(
+            time, alpha, dis, H1, D1, H2, D2, reaSource=reaSource,
+            imgSource=imgSource, approximation=approximation, N=N)
+
+    p = np.array([1., -1., 1., -1., 1., -1., 1., -1.])
+    q = np.stack([D2 - D1 + H2,
+                  D2 - D1,
+                  D2 - D1 - H1,
+                  D2 - D1 + H2 - H1,
+                  D2 + D1 + H2,
+                  D2 + D1,
+                  D2 + D1 + H1,
+                  D2 + D1 + H2 + H1],
+                 axis=-1)
+    dis_arr = np.asarray(dis, dtype=np.float64)
+    trailing = (1,) * (q.ndim - 1)
+    # many of the q values coincide (segments share dimensions), so erfint is only
+    # evaluated at the unique values and the result is scattered back afterwards.
+    # This yields exactly the same values, since erfint works pointwise.
+    q_unique, q_inverse = np.unique(q.reshape(-1), return_inverse=True)
+
+    def f_batched(s):
+        n = len(s)
+        s_col = s.reshape((n,) + trailing)
+        erfint_q = _erfint(np.multiply.outer(s, q_unique))[:, q_inverse].reshape((n,) + q.shape)
+        inner = np.einsum('k,...k->...', p, erfint_q)
+        exp_term = np.exp(-dis_arr ** 2 * s_col ** 2) if dis_arr.ndim == 0 else \
+            np.exp(-dis_arr[None, ...] ** 2 * s.reshape((n,) + (1,) * dis_arr.ndim) ** 2
+                   ).reshape((n,) + (1,) * (q.ndim - 1 - dis_arr.ndim) + dis_arr.shape)
+        return s_col ** -2 * exp_term * inner
+
+    # Lower bounds of integration
+    a = 1.0 / np.sqrt(4.0 * alpha * np.asarray(time, dtype=np.float64))
+    # first time value: integral over the semi-infinite interval, evaluated with
+    # scipy's quad_vec exactly as pygfunction does
+    f = _finite_line_source_integrand_pygf(dis, H1, D1, H2, D2, reaSource, imgSource)
+    h_first = 0.5 / H2 * quad_vec(f, a[0], np.inf)[0]
+    # remaining time values: batched adaptive quadrature over the finite intervals
+    pieces = _adaptive_gk21_batched(f_batched, a[1:], a[:-1])
+    pieces = np.asarray(0.5 / H2)[..., None] * np.moveaxis(pieces, 0, -1)
+    h = np.cumsum(np.concatenate([h_first[..., None], pieces], axis=-1), axis=-1)
+    return h
+
+
+def _finite_line_source_equivalent_boreholes_vectorized_batched(
+        time, alpha, dis, wDis, H1, D1, H2, D2, N2, reaSource=True, imgSource=True):
+    """
+    Evaluate the equivalent Finite Line Source (FLS) solution for an array of time
+    values.
+
+    This is numerically equivalent to pygfunction's
+    :func:`finite_line_source_equivalent_boreholes_vectorized` (same integral, same
+    adaptive Gauss-Kronrod rule and tolerances), but batches the integrand
+    evaluations over the quadrature nodes of all time intervals at once. It falls
+    back to the pygfunction implementation whenever the inputs are not of the
+    expected form.
+    """
+    dis_arr = np.asarray(dis, dtype=np.float64)
+    wDis_arr = np.asarray(wDis, dtype=np.float64)
+    if (not (reaSource and imgSource) or np.ndim(time) == 0
+            or isinstance(time, (np.floating, float)) or len(np.atleast_1d(time)) < 2
+            or dis_arr.ndim != 2 or wDis_arr.ndim != 2):
+        return finite_line_source_equivalent_boreholes_vectorized(
+            time, alpha, dis, wDis, H1, D1, H2, D2, N2,
+            reaSource=reaSource, imgSource=imgSource)
+
+    p = np.array([1., -1., 1., -1., 1., -1., 1., -1.])
+    q = np.stack([D2 - D1 + H2,
+                  D2 - D1,
+                  D2 - D1 - H1,
+                  D2 - D1 + H2 - H1,
+                  D2 + D1 + H2,
+                  D2 + D1,
+                  D2 + D1 + H1,
+                  D2 + D1 + H2 + H1],
+                 axis=-1)
+
+    # many of the q values coincide (segments share dimensions), so erfint is only
+    # evaluated at the unique values and the result is scattered back afterwards.
+    # This yields exactly the same values, since erfint works pointwise.
+    q_unique, q_inverse = np.unique(q.reshape(-1), return_inverse=True)
+
+    def f_batched(s):
+        n = len(s)
+        s2 = (s ** 2).reshape((n, 1, 1))
+        erfint_q = _erfint(np.multiply.outer(s, q_unique))[:, q_inverse].reshape((n,) + q.shape)
+        inner = np.einsum('k,...k->...', p, erfint_q)
+        # ( exp(-dis²s²) @ wDis ).T per quadrature point
+        mm = np.swapaxes(np.exp(-dis_arr[None, ...] ** 2 * s2) @ wDis_arr, -1, -2)
+        return s2 ** -1 * mm * inner
+
+    a = 1.0 / np.sqrt(4.0 * alpha * np.asarray(time, dtype=np.float64))
+    f = _finite_line_source_equivalent_boreholes_integrand_pygf(
+        dis, wDis, H1, D1, H2, D2, N2, reaSource, imgSource)
+    h_first = 0.5 / (N2 * H2) * quad_vec(f, a[0], np.inf)[0]
+    pieces = _adaptive_gk21_batched(f_batched, a[1:], a[:-1])
+    pieces = np.asarray(0.5 / (N2 * H2))[..., None] * np.moveaxis(pieces, 0, -1)
+    h = np.cumsum(np.concatenate([h_first[..., None], pieces], axis=-1), axis=-1)
+    return h
+
+
+# cache for the cylindrical heat source correction: during an iterative sizing the
+# correction is requested over and over with identical (time, alpha, r, r_b) inputs
+_CHS_CACHE: dict = {}
+_CHS_CACHE_MAX_SIZE: int = 32
 
 
 # update pygfunction
@@ -68,6 +381,14 @@ def cylindrical_heat_source(
     CHS_integrand = lambda u: (1. / (u ** 2 * np.pi ** 2) * (np.exp(-u ** 2 * Fo) - 1.0)
                                / (j1(u) ** 2 + y1(u) ** 2) * (j0(p * u) * y1(u) - j1(u) * y0(p * u)))
 
+    # the CHS solution only depends on (time, alpha, r, r_b); during an iterative
+    # sizing it is requested many times with identical inputs, so cache the result
+    time_arr = np.asarray(time, dtype=np.float64)
+    key = (float(alpha), float(r), float(r_b), time_arr.shape, time_arr.tobytes())
+    cached = _CHS_CACHE.get(key)
+    if cached is not None:
+        return cached.copy() if isinstance(cached, np.ndarray) else cached
+
     # Fourier number
     Fo = alpha * time / r_b ** 2
     # Normalized distance from borehole axis
@@ -78,6 +399,10 @@ def cylindrical_heat_source(
     b = np.inf
     # Evaluate integral using Gauss-Kronrod
     G = quad_vec(CHS_integrand, a, b)[0]
+
+    if len(_CHS_CACHE) >= _CHS_CACHE_MAX_SIZE:
+        _CHS_CACHE.clear()
+    _CHS_CACHE[key] = G.copy() if isinstance(G, np.ndarray) else G
     return G
 
 
@@ -176,7 +501,7 @@ def thermal_response_factors(self, time, alpha, kind='linear'):
         N2 = np.array(
             [[self.boreholes[j].nBoreholes for (i, j) in pairs]]).T
         # Evaluate FLS at all time steps
-        h = finite_line_source_equivalent_boreholes_vectorized(
+        h = _finite_line_source_equivalent_boreholes_vectorized_batched(
             time, alpha, dis, wDis, H1, D1, H2, D2, N2)
         # Broadcast values to h_ij matrix
         for k, (i, j) in enumerate(pairs):
@@ -207,9 +532,16 @@ def thermal_response_factors(self, time, alpha, kind='linear'):
             dis = 0.0005 * self.boreholes[i].H
         else:
             dis = self.boreholes[i].r_b
-        h = finite_line_source_vectorized(
+        h = _finite_line_source_vectorized_batched(
             time, alpha, dis, H1, D1, H2, D2,
             approximation=self.approximate_FLS, N=self.nFLS)
+        # the correction terms only depend on the group (not the individual
+        # borehole), so they are computed once outside the loop
+        if self.cylindrical_correction:
+            r_b = self.boreholes[group[0]].r_b
+            h_ils = infinite_line_source(time, alpha, dis)
+            h_chs = cylindrical_heat_source(time, alpha, r_b, r_b)
+            correction = 2 * np.pi * h_chs - 0.5 * h_ils
         # Broadcast values to h_ij matrix
         for i in group:
             i_segment = self._i0Segments[i] + i_pair
@@ -218,12 +550,9 @@ def thermal_response_factors(self, time, alpha, kind='linear'):
                 h_ij[j_segment, i_segment, 1:] + h[0, k_pair, :]
 
             if self.cylindrical_correction:
-                r_b = self.boreholes[i].r_b
                 ii_segment = j_segment[j_segment == i_segment]
-                h_ils = infinite_line_source(time, alpha, dis)
-                h_chs = cylindrical_heat_source(time, alpha, r_b, r_b)
                 h_ij[ii_segment, ii_segment, 1:] = (
-                        h_ij[ii_segment, ii_segment, 1:] + 2 * np.pi * h_chs - 0.5 * h_ils)
+                        h_ij[ii_segment, ii_segment, 1:] + correction)
 
     # Return 2d array if time is a scalar
     if np.isscalar(time):
