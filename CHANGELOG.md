@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.4.2] - Unpublished
 
+### Added
+
+- Add _design_borefield_configuration_: an all-at-once (simultaneous) optimisation of the borefield configuration,
+  where the number of boreholes, the spacing and the borehole length are optimised jointly with a smooth,
+  physics-based surrogate NLP, after which every candidate is certified with exact sizings.
+
+### Changed
+
+- Drastically improved the performance of the g-function calculation, the sizing methods and the temperature profile
+  calculations (2.5-3.5x faster) without changing the results: batched adaptive quadrature for the finite line source
+  integrals, caching of the cylindrical correction and convolution kernels, faster load resampling and memoisation of
+  the building load conversion.
+- Import torch lazily, which more than halves the import time of GHEtool.
+
 ### Fixed
 
 - Fix issue with pyparsing.tools (issue #460, thans to helgakovacs).
