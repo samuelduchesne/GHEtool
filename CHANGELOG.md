@@ -16,8 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (the fluid temperature is linear in the dispatched load), solved with constraint-row generation, certified with
   the exact hourly temperature calculation and returning the shadow prices of the binding temperature constraints
   (the marginal value of extra borehole length).
+- Add _LaplaceGFunction_ (`calculate_gfunction`): a fast, continuous g-function that rides pygfunction's public
+  solvers (including the Laplace-domain solver, whose cost is independent of the number of time values) instead of
+  GHEtool's solver monkeypatch, and re-adds the finite-radius cylindrical correction as a proven field-independent
+  early-time delta (single-borehole correction reproduces the full-field correction to < 0.008 g-units). Falls back
+  to the _equivalent_ solver when the Laplace method is not available in the installed pygfunction.
 
 ### Changed
+
+- Make the cylindrical-correction FLS quadrature import-robust across pygfunction versions: the private
+  `_finite_line_source_integrand` factories (removed by pygfunction's vectorized-quadrature rewrite) are now imported
+  behind a guard, falling back to the public vectorized FLS functions for the first time value. Bit-identical on
+  pygfunction releases that still expose them; imports and runs on releases that do not.
 
 - Drastically improved the performance of the g-function calculation, the sizing methods and the temperature profile
   calculations (2.5-3.5x faster) without changing the results: batched adaptive quadrature for the finite line source

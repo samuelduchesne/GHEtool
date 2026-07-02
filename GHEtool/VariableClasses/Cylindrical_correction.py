@@ -10,9 +10,20 @@ import numpy as np
 from pygfunction.boreholes import Borehole, _EquivalentBorehole, find_duplicates
 from pygfunction.heat_transfer import finite_line_source, finite_line_source_vectorized, \
     finite_line_source_equivalent_boreholes_vectorized
-from pygfunction.heat_transfer import _finite_line_source_integrand as _finite_line_source_integrand_pygf
-from pygfunction.heat_transfer import \
-    _finite_line_source_equivalent_boreholes_integrand as _finite_line_source_equivalent_boreholes_integrand_pygf
+# The private FLS integrand factories are only used to evaluate the first (smallest)
+# time value over the semi-infinite integration interval. They were removed by the
+# vectorized-quadrature rewrite in newer pygfunction; when unavailable we fall back to
+# the public vectorized FLS functions, which evaluate the exact same quantity. Guarding
+# the import keeps GHEtool bit-identical on pygfunction releases that still expose them.
+try:
+    from pygfunction.heat_transfer import _finite_line_source_integrand as _finite_line_source_integrand_pygf
+    from pygfunction.heat_transfer import \
+        _finite_line_source_equivalent_boreholes_integrand as _finite_line_source_equivalent_boreholes_integrand_pygf
+    _HAVE_PYGF_PRIVATE_INTEGRAND = True
+except ImportError:  # pragma: no cover - depends on the installed pygfunction version
+    _finite_line_source_integrand_pygf = None
+    _finite_line_source_equivalent_boreholes_integrand_pygf = None
+    _HAVE_PYGF_PRIVATE_INTEGRAND = False
 from pygfunction.networks import network_thermal_resistance
 
 from scipy.integrate import quad_vec
@@ -259,9 +270,15 @@ def _finite_line_source_vectorized_batched(
     # Lower bounds of integration
     a = 1.0 / np.sqrt(4.0 * alpha * np.asarray(time, dtype=np.float64))
     # first time value: integral over the semi-infinite interval, evaluated with
-    # scipy's quad_vec exactly as pygfunction does
-    f = _finite_line_source_integrand_pygf(dis, H1, D1, H2, D2, reaSource, imgSource)
-    h_first = 0.5 / H2 * quad_vec(f, a[0], np.inf)[0]
+    # scipy's quad_vec exactly as pygfunction does (or with the public vectorized FLS
+    # function when the private integrand factory is not available, see the import guard)
+    if _HAVE_PYGF_PRIVATE_INTEGRAND:
+        f = _finite_line_source_integrand_pygf(dis, H1, D1, H2, D2, reaSource, imgSource)
+        h_first = 0.5 / H2 * quad_vec(f, a[0], np.inf)[0]
+    else:
+        h_first = finite_line_source_vectorized(
+            np.atleast_1d(time)[0], alpha, dis, H1, D1, H2, D2,
+            reaSource=reaSource, imgSource=imgSource)
     # remaining time values: batched adaptive quadrature over the finite intervals
     pieces = _adaptive_gk21_batched(f_batched, a[1:], a[:-1])
     pieces = np.asarray(0.5 / H2)[..., None] * np.moveaxis(pieces, 0, -1)
@@ -317,9 +334,14 @@ def _finite_line_source_equivalent_boreholes_vectorized_batched(
         return s2 ** -1 * mm * inner
 
     a = 1.0 / np.sqrt(4.0 * alpha * np.asarray(time, dtype=np.float64))
-    f = _finite_line_source_equivalent_boreholes_integrand_pygf(
-        dis, wDis, H1, D1, H2, D2, N2, reaSource, imgSource)
-    h_first = 0.5 / (N2 * H2) * quad_vec(f, a[0], np.inf)[0]
+    if _HAVE_PYGF_PRIVATE_INTEGRAND:
+        f = _finite_line_source_equivalent_boreholes_integrand_pygf(
+            dis, wDis, H1, D1, H2, D2, N2, reaSource, imgSource)
+        h_first = 0.5 / (N2 * H2) * quad_vec(f, a[0], np.inf)[0]
+    else:
+        h_first = finite_line_source_equivalent_boreholes_vectorized(
+            np.atleast_1d(time)[0], alpha, dis, wDis, H1, D1, H2, D2, N2,
+            reaSource=reaSource, imgSource=imgSource)
     pieces = _adaptive_gk21_batched(f_batched, a[1:], a[:-1])
     pieces = np.asarray(0.5 / (N2 * H2))[..., None] * np.moveaxis(pieces, 0, -1)
     h = np.cumsum(np.concatenate([h_first[..., None], pieces], axis=-1), axis=-1)
