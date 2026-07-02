@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add _design_borefield_configuration_: an all-at-once (simultaneous) optimisation of the borefield configuration,
   where the number of boreholes, the spacing and the borehole length are optimised jointly with a smooth,
   physics-based surrogate NLP, after which every candidate is certified with exact sizings.
+- Add _optimise_load_profile_lp_: a globally optimal hybrid dispatch optimisation formulated as a linear program
+  (the fluid temperature is linear in the dispatched load), solved with constraint-row generation, certified with
+  the exact hourly temperature calculation and returning the shadow prices of the binding temperature constraints
+  (the marginal value of extra borehole length).
 
 ### Changed
 

@@ -2,3 +2,4 @@ from .optimise_load_profile import optimise_load_profile_power, optimise_load_pr
     optimise_load_profile_balance
 from .optimise_borefield_configuration import *
 from .joint_borefield_design import design_borefield_configuration
+from .optimise_load_profile_lp import optimise_load_profile_lp
