@@ -10,7 +10,7 @@ iteration:
 
     max   total energy served by the borefield        (objective='energy')
     min   external (backup) peak capacity needed      (objective='power')
-    s.t.  Tf_min <= Tf(t) <= Tf_max     for every hour of the first and the last year
+    s.t.  Tf_min <= Tf(t) <= Tf_max     for every hour of every simulated year
           0 <= served(t) <= demand(t)   for every hour
 
 Only a handful of the temperature constraints bind at the optimum (the hours in which
@@ -32,18 +32,119 @@ returned as well: they quantify the marginal value of relaxing the temperature b
 and, through the 1/length scaling of the temperature response, the marginal value of
 additional borehole length. This is the coupling quantity for a joint
 configuration-and-dispatch (two-stage) design optimisation.
+
+The LP is solved through an incremental *sparse* model: capacity rows (two
+nonzeros each) enter up front, temperature rows are constraint-generated, and,
+when the optional ``highspy`` package is installed, every re-solve (including
+the lexicographic second phase) hot-starts from the previous HiGHS basis
+instead of re-factorising a dense matrix from scratch.
 """
 import copy
 
 import numpy as np
 
+from scipy import sparse
 from scipy.optimize import linprog
 from scipy.signal import fftconvolve
 
 from GHEtool.VariableClasses import SCOP, SEER
 from GHEtool.VariableClasses.LoadData import HourlyBuildingLoad
 
+try:  # optional accelerator: incremental rows + hot-started re-solves
+    import highspy
+    _HAS_HIGHSPY = True
+except ImportError:  # pragma: no cover - highspy is an optional extra
+    _HAS_HIGHSPY = False
+
 __all__ = ['optimise_load_profile_lp']
+
+
+class _IncrementalSparseLP:
+    """Incremental sparse LP: min c @ x  s.t.  A_ub @ x <= b_ub, lb <= x <= ub.
+
+    The constraint matrix is stored sparse: a capacity row has two nonzeros and
+    a temperature row at most 2 x 8760, so the LP that used to be handed to the
+    solver as a ~9000 x 17522 *dense* array (99.97 % zeros) shrinks to a few
+    hundred thousand nonzeros.
+
+    With ``highspy`` installed the model lives inside a single HiGHS instance:
+    rows are added incrementally between solves and every re-solve hot-starts
+    from the previous basis, so each constraint-generation round only pays for
+    the marginal work. Without it, ``scipy.optimize.linprog`` is called on the
+    sparse matrix each round - identical solution, just cold-started.
+
+    Duals returned by :meth:`solve` follow scipy's ``ineqlin.marginals``
+    convention: non-positive for a binding ``<=`` row of a minimisation
+    (dObjective / dRHS).
+    """
+
+    def __init__(self, c, lb, ub):
+        self.n = len(c)
+        self.c = np.asarray(c, dtype=np.float64)
+        self.lb = np.asarray(lb, dtype=np.float64)
+        self.ub = np.asarray(ub, dtype=np.float64)
+        self._rows_idx: list = []
+        self._rows_val: list = []
+        self._rhs: list = []
+        self._h = None
+        if _HAS_HIGHSPY:
+            self._h = highspy.Highs()
+            self._h.setOptionValue('output_flag', False)
+            upper = np.where(np.isinf(self.ub), highspy.kHighsInf, self.ub)
+            self._h.addCols(self.n, self.c, self.lb, upper,
+                            0, np.array([], dtype=np.int32), np.array([], dtype=np.int32),
+                            np.array([], dtype=np.float64))
+
+    def add_rows(self, rows_idx, rows_val, rhs):
+        """Add ``<=`` rows given as (column-index array, value array) pairs."""
+        if not len(rhs):
+            return
+        self._rows_idx.extend(rows_idx)
+        self._rows_val.extend(rows_val)
+        self._rhs.extend(float(r) for r in rhs)
+        if self._h is not None:
+            lengths = np.array([len(i) for i in rows_idx], dtype=np.int32)
+            starts = np.concatenate(([0], np.cumsum(lengths[:-1]))).astype(np.int32)
+            indices = np.concatenate(rows_idx).astype(np.int32)
+            values = np.concatenate(rows_val).astype(np.float64)
+            self._h.addRows(len(rhs), np.full(len(rhs), -highspy.kHighsInf),
+                            np.asarray(rhs, dtype=np.float64),
+                            len(indices), starts, indices, values)
+
+    def set_costs(self, c):
+        self.c = np.asarray(c, dtype=np.float64)
+        if self._h is not None:
+            self._h.changeColsCost(self.n, np.arange(self.n, dtype=np.int32), self.c)
+
+    def set_bounds(self, j, lower, upper):
+        self.lb[j], self.ub[j] = lower, upper
+        if self._h is not None:
+            self._h.changeColBounds(j, lower,
+                                    upper if np.isfinite(upper) else highspy.kHighsInf)
+
+    def solve(self):
+        """Solve and return ``(x, row_duals)``; raises ValueError when not optimal."""
+        if self._h is not None:
+            self._h.run()
+            status = self._h.getModelStatus()
+            if status != highspy.HighsModelStatus.kOptimal:
+                raise ValueError('The LP dispatch optimisation failed: '
+                                 f'{self._h.modelStatusToString(status)}')
+            solution = self._h.getSolution()
+            duals = np.asarray(solution.row_dual) if self._rhs else np.array([])
+            return np.asarray(solution.col_value), duals
+        a_ub = None
+        if self._rhs:
+            indptr = np.concatenate(([0], np.cumsum([len(i) for i in self._rows_idx])))
+            a_ub = sparse.csr_matrix(
+                (np.concatenate(self._rows_val), np.concatenate(self._rows_idx), indptr),
+                shape=(len(self._rhs), self.n))
+        res = linprog(self.c, A_ub=a_ub, b_ub=np.asarray(self._rhs) if self._rhs else None,
+                      bounds=np.column_stack((self.lb, self.ub)), method='highs')
+        if not res.success:
+            raise ValueError(f'The LP dispatch optimisation failed: {res.message}')
+        duals = res.ineqlin.marginals if self._rhs else np.array([])
+        return res.x, duals
 
 
 def optimise_load_profile_lp(
@@ -130,27 +231,34 @@ def optimise_load_profile_lp(
     scale = 1000. / (2 * np.pi * k_s * L_tot)   # K per kW of load in the convolution
     rb_term = 1000. * Rb / L_tot                # K per kW of load at the same hour
 
-    # year-folded convolution kernel: exact multi-year response of a periodic load
-    K = np.zeros(2 * P - 1)
-    for j in range(years):
-        lo, hi = j * P - (P - 1), j * P + P
-        src = dg[max(lo, 0):min(hi, years * P)]
-        K[max(lo, 0) - lo: max(lo, 0) - lo + len(src)] += src
-    K_first = dg[:P]
+    # Year-folded convolution kernels: K_j gives the exact temperature in year j
+    # of a periodic load (j = 1 is the first year, j = years the steady drift of
+    # the last year). Constraints are generated for *every* year: when the
+    # dispatch balances the field, the first-order year-over-year drift
+    # vanishes and the seasonal second-order term can make an intermediate year
+    # (typically year 2) the binding one, which first/last-year-only
+    # constraints would miss.
+    _kernels: dict = {}
 
-    def temperatures(q):
-        """fluid temperature in the first and the last year for a periodic load q [kW]"""
-        T_first = Tg + scale * fftconvolve(q, K_first)[:P] + rb_term * q
-        T_last = Tg + scale * fftconvolve(q, K)[P - 1:2 * P - 1] + rb_term * q
-        return T_first, T_last
+    def year_kernel(j):
+        """Folded kernel of year ``j`` (1-based), on a 2P-1 support."""
+        if j not in _kernels:
+            K = np.zeros(2 * P - 1)
+            for i in range(j):
+                lo, hi = i * P - (P - 1), i * P + P
+                src = dg[max(lo, 0):min(hi, years * P)]
+                K[max(lo, 0) - lo: max(lo, 0) - lo + len(src)] += src
+            _kernels[j] = K
+        return _kernels[j]
 
-    def temperature_row(tau, last_year):
-        """row a such that Tf(tau) = Tg + a . q"""
-        a = np.zeros(P)
-        if last_year:
-            a[:] = scale * K[tau - np.arange(P) + P - 1]
-        else:
-            a[:tau + 1] = scale * K_first[tau::-1]
+    def temperatures_all_years(q):
+        """Fluid temperature at every hour of the whole horizon for periodic q [kW]."""
+        q_full = np.tile(q, years)
+        return Tg + scale * fftconvolve(q_full, dg)[:years * P] + rb_term * q_full
+
+    def temperature_row(tau, year):
+        """row a such that Tf(tau of year ``year``) = Tg + a . q"""
+        a = scale * year_kernel(year)[tau - np.arange(P) + P - 1]
         a[tau] += rb_term
         return a
 
@@ -160,110 +268,93 @@ def optimise_load_profile_lp(
     # ------------------------------------------------------------------
     n_extra = 2 if objective == 'power' else 0
     nvar = 2 * P + n_extra
-    bounds = [(0., d) for d in dem_h] + [(0., d) for d in dem_c] + [(0., None)] * n_extra
+    lb = np.zeros(nvar)
+    ub = np.concatenate((dem_h, dem_c, np.full(n_extra, np.inf)))
     if objective == 'energy':
         c = np.concatenate((-np.ones(2 * P), np.zeros(n_extra)))
     else:
         c = np.zeros(nvar)
         c[-2:] = 1.
 
-    A_ub, b_ub, row_info = [], [], []
-    added_T, added_cap = set(), set()
-
-    def add_capacity_row(u, side):
-        # dem - x <= Cap  ->  -x - Cap <= -dem
-        r = np.zeros(nvar)
-        r[u if side == 'h' else P + u] = -1.
-        r[-2 if side == 'h' else -1] = -1.
-        A_ub.append(r)
-        b_ub.append(-(dem_h[u] if side == 'h' else dem_c[u]))
-        row_info.append(None)
-        added_cap.add((u, side))
-
-    def add_temperature_row(tau, last_year, sign):
-        a = temperature_row(tau, last_year)
-        r = np.zeros(nvar)
-        r[:P] = sign * (-f_h) * a
-        r[P:2 * P] = sign * f_c * a
-        A_ub.append(r)
-        b_ub.append((Tf_max - Tg) if sign > 0 else (Tg - Tf_min))
-        row_info.append((tau, last_year, sign))
-        added_T.add((tau, last_year, sign))
+    lp = _IncrementalSparseLP(c, lb, ub)
+    row_info = []
+    added_T = set()
 
     if objective == 'power':
-        for u in np.argsort(dem_h)[-50:]:
-            if dem_h[u] > 0:
-                add_capacity_row(int(u), 'h')
-        for u in np.argsort(dem_c)[-50:]:
-            if dem_c[u] > 0:
-                add_capacity_row(int(u), 'c')
+        # All capacity rows (dem - x <= Cap  ->  -x - Cap <= -dem) are known a
+        # priori and have two nonzeros each: add them up front in one batch
+        # instead of discovering thousands of them one round at a time.
+        rows_idx, rows_val, rhs = [], [], []
+        for u in np.flatnonzero(dem_h > 0):
+            rows_idx.append(np.array([u, nvar - 2]))
+            rows_val.append(np.array([-1., -1.]))
+            rhs.append(-dem_h[u])
+            row_info.append(None)
+        for u in np.flatnonzero(dem_c > 0):
+            rows_idx.append(np.array([P + u, nvar - 1]))
+            rows_val.append(np.array([-1., -1.]))
+            rhs.append(-dem_c[u])
+            row_info.append(None)
+        lp.add_rows(rows_idx, rows_val, rhs)
 
-    def solve_current(c_vec, extra_bounds=None):
-        return linprog(c_vec, A_ub=np.asarray(A_ub) if A_ub else None, b_ub=np.asarray(b_ub) if b_ub else None,
-                       bounds=extra_bounds if extra_bounds is not None else bounds, method='highs')
+    def generate_temperature_rows(x):
+        """Add the temperature rows violated by dispatch ``x``; return the count.
 
-    res, x = None, None
-    for _ in range(max_lp_rounds):
-        res = solve_current(c)
-        if not res.success:
-            raise ValueError(f'The LP dispatch optimisation failed: {res.message}')
-        x = res.x
+        The exact temperature of every hour of every year is scanned, so the
+        generated constraint set covers intermediate years as well; at
+        convergence the LP dispatch respects the band over the whole horizon.
+        """
         q = f_c * x[P:2 * P] - f_h * x[:P]
-        T_first, T_last = temperatures(q)
+        T = temperatures_all_years(q).reshape(years, P)
+        rows_idx, rows_val, rhs = [], [], []
+        for sign in (1., -1.):
+            v = sign * T - (Tf_max if sign > 0 else -Tf_min)
+            # Per hour, only the worst year can bind the pointwise maximum; the
+            # per-year kernels converge geometrically in the year index, so
+            # adding every violated year would flood the LP with near-duplicate
+            # rows. If a different year later becomes the worst for an hour, it
+            # is added in a subsequent round.
+            worst_year = np.argmax(v, axis=0)
+            worst_v = v[worst_year, np.arange(P)]
+            for tau in np.argsort(worst_v)[-160:]:
+                if worst_v[tau] > 1e-7:
+                    tau, year = int(tau), int(worst_year[tau]) + 1
+                    if (tau, year, sign) in added_T:
+                        continue
+                    a = temperature_row(tau, year)
+                    coeff = np.concatenate((sign * (-f_h) * a, sign * f_c * a))
+                    nz = np.flatnonzero(coeff)
+                    rows_idx.append(nz)
+                    rows_val.append(coeff[nz])
+                    rhs.append((Tf_max - Tg) if sign > 0 else (Tg - Tf_min))
+                    row_info.append((tau, year, sign))
+                    added_T.add((tau, year, sign))
+        lp.add_rows(rows_idx, rows_val, rhs)
+        return len(rhs)
 
-        new_rows = 0
-        for T, last_year in ((T_first, False), (T_last, True)):
-            for sign in (1., -1.):
-                v = sign * T - (Tf_max if sign > 0 else -Tf_min)
-                for i in np.argsort(v)[-80:]:
-                    if v[i] > 1e-7 and (int(i), last_year, sign) not in added_T:
-                        add_temperature_row(int(i), last_year, sign)
-                        new_rows += 1
-        if objective == 'power':
-            cap_h, cap_c = x[-2], x[-1]
-            for u in np.where(dem_h - x[:P] > cap_h + 1e-7)[0]:
-                if (int(u), 'h') not in added_cap:
-                    add_capacity_row(int(u), 'h')
-                    new_rows += 1
-            for u in np.where(dem_c - x[P:2 * P] > cap_c + 1e-7)[0]:
-                if (int(u), 'c') not in added_cap:
-                    add_capacity_row(int(u), 'c')
-                    new_rows += 1
-        if new_rows == 0:
+    x, duals = None, np.array([])
+    for _ in range(max_lp_rounds):
+        x, duals = lp.solve()
+        if generate_temperature_rows(x) == 0:
             break
     else:
         raise ValueError('The LP dispatch optimisation did not converge within the allowed number of rounds.')
 
     if objective == 'power':
-        # lexicographic refinement: fix the optimal capacities, maximise the served energy
+        # lexicographic refinement: fix the optimal capacities, maximise the
+        # served energy. The model (and its basis, with highspy) is reused: only
+        # the objective and the two capacity bounds change.
         cap_h, cap_c = x[-2], x[-1]
-        c2 = np.concatenate((-np.ones(2 * P), np.zeros(2)))
-        bounds2 = bounds[:2 * P] + [(0., cap_h + 1e-9), (0., cap_c + 1e-9)]
-        for _ in range(max_lp_rounds):
-            res = solve_current(c2, bounds2)
-            if not res.success:  # pragma: no cover
-                break
-            x = res.x
-            q = f_c * x[P:2 * P] - f_h * x[:P]
-            T_first, T_last = temperatures(q)
-            new_rows = 0
-            for T, last_year in ((T_first, False), (T_last, True)):
-                for sign in (1., -1.):
-                    v = sign * T - (Tf_max if sign > 0 else -Tf_min)
-                    for i in np.argsort(v)[-80:]:
-                        if v[i] > 1e-7 and (int(i), last_year, sign) not in added_T:
-                            add_temperature_row(int(i), last_year, sign)
-                            new_rows += 1
-            for u in np.where(dem_h - x[:P] > cap_h + 1e-6)[0]:
-                if (int(u), 'h') not in added_cap:
-                    add_capacity_row(int(u), 'h')
-                    new_rows += 1
-            for u in np.where(dem_c - x[P:2 * P] > cap_c + 1e-6)[0]:
-                if (int(u), 'c') not in added_cap:
-                    add_capacity_row(int(u), 'c')
-                    new_rows += 1
-            if new_rows == 0:
-                break
+        lp.set_costs(np.concatenate((-np.ones(2 * P), np.zeros(2))))
+        lp.set_bounds(nvar - 2, 0., cap_h + 1e-9)
+        lp.set_bounds(nvar - 1, 0., cap_c + 1e-9)
+        try:
+            for _ in range(max_lp_rounds):
+                x, duals = lp.solve()
+                if generate_temperature_rows(x) == 0:
+                    break
+        except ValueError:  # pragma: no cover - keep the phase-1 dispatch
+            pass
 
     served_h, served_c = x[:P], x[P:2 * P]
 
@@ -292,16 +383,16 @@ def optimise_load_profile_lp(
     # shadow prices of the binding temperature constraints; the marginal objective
     # value of extra borehole length follows from the 1/length scaling of the
     # temperature response: dTf/dL = -(Tf - Tg)/L at the binding hours
-    marginals = res.ineqlin.marginals if row_info else np.array([])
+    marginals = duals if row_info else np.array([])
     shadow = []
     marginal_value_length = 0.
     for i, info in enumerate(row_info):
         if info is None or abs(marginals[i]) < 1e-12:
             continue
-        tau, last_year, sign = info
+        tau, year, sign = info
         lam = -marginals[i]  # positive shadow price of tightening the constraint
         limit = Tf_max if sign > 0 else Tf_min
-        shadow.append({'hour': tau, 'year': years if last_year else 1,
+        shadow.append({'hour': tau, 'year': year,
                        'limit': limit, 'shadow_price': lam})
         marginal_value_length += lam * abs(limit - Tg) / L_tot
     info = {'temperature_constraints': shadow,

@@ -24,6 +24,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Rework the LP solve machinery of _optimise_load_profile_lp_ around an incremental *sparse* model: the constraint
+  matrix (previously a ~9000 x 17522 dense array that was 99.97 % zeros) is stored sparse, all capacity rows (two
+  nonzeros each) enter the model up front instead of being discovered one constraint-generation round at a time, and,
+  when the optional `highspy` package is installed, rows are added into a persistent HiGHS instance so every re-solve
+  (including the lexicographic 'power' second phase) hot-starts from the previous basis. Same certified optimum
+  (identical served energy, backup capacities and shadow prices within solver tolerance); an order of magnitude to
+  two orders of magnitude faster on undersized fields.
+
+### Fixed
+
+- The LP dispatch now generates temperature constraints for **every simulated year** (per-hour, worst-year rows from
+  per-year folded kernels) instead of the first and the last year only. When the optimal dispatch balances the field,
+  the first-order year-over-year temperature drift vanishes and an intermediate year (typically year 2) can become
+  the binding one: previously this either failed the certification outright (heavily undersized fields) or returned a
+  dispatch whose shadow prices belonged to an under-constrained problem. The first/last-year rows are the special
+  cases j = 1 and j = simulation_period of the new per-year kernels.
 - Make the cylindrical-correction FLS quadrature import-robust across pygfunction versions: the private
   `_finite_line_source_integrand` factories (removed by pygfunction's vectorized-quadrature rewrite) are now imported
   behind a guard, falling back to the public vectorized FLS functions for the first time value. Bit-identical on
