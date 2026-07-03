@@ -78,11 +78,13 @@ class _IncrementalSparseLP:
     (dObjective / dRHS).
     """
 
-    def __init__(self, c, lb, ub):
+    def __init__(self, c, lb, ub, time_limit=None):
         self.n = len(c)
+        self.n_rows = 0
         self.c = np.asarray(c, dtype=np.float64)
         self.lb = np.asarray(lb, dtype=np.float64)
         self.ub = np.asarray(ub, dtype=np.float64)
+        self.time_limit = time_limit
         self._rows_idx: list = []
         self._rows_val: list = []
         self._rhs: list = []
@@ -90,6 +92,8 @@ class _IncrementalSparseLP:
         if _HAS_HIGHSPY:
             self._h = highspy.Highs()
             self._h.setOptionValue('output_flag', False)
+            if time_limit is not None:
+                self._h.setOptionValue('time_limit', float(time_limit))
             upper = np.where(np.isinf(self.ub), highspy.kHighsInf, self.ub)
             self._h.addCols(self.n, self.c, self.lb, upper,
                             0, np.array([], dtype=np.int32), np.array([], dtype=np.int32),
@@ -99,10 +103,10 @@ class _IncrementalSparseLP:
         """Add ``<=`` rows given as (column-index array, value array) pairs."""
         if not len(rhs):
             return
-        self._rows_idx.extend(rows_idx)
-        self._rows_val.extend(rows_val)
-        self._rhs.extend(float(r) for r in rhs)
+        self.n_rows += len(rhs)
         if self._h is not None:
+            # HiGHS owns the rows: keeping a Python mirror as well doubles the
+            # memory of an already large model for nothing.
             lengths = np.array([len(i) for i in rows_idx], dtype=np.int32)
             starts = np.concatenate(([0], np.cumsum(lengths[:-1]))).astype(np.int32)
             indices = np.concatenate(rows_idx).astype(np.int32)
@@ -110,6 +114,10 @@ class _IncrementalSparseLP:
             self._h.addRows(len(rhs), np.full(len(rhs), -highspy.kHighsInf),
                             np.asarray(rhs, dtype=np.float64),
                             len(indices), starts, indices, values)
+            return
+        self._rows_idx.extend(rows_idx)
+        self._rows_val.extend(rows_val)
+        self._rhs.extend(float(r) for r in rhs)
 
     def set_costs(self, c):
         self.c = np.asarray(c, dtype=np.float64)
@@ -123,7 +131,12 @@ class _IncrementalSparseLP:
                                     upper if np.isfinite(upper) else highspy.kHighsInf)
 
     def solve(self):
-        """Solve and return ``(x, row_duals)``; raises ValueError when not optimal."""
+        """Solve and return ``(x, row_duals)``; raises ValueError when not optimal.
+
+        A configured ``time_limit`` makes a pathological solve (heavily
+        degenerate deep-undersizing cases) fail fast with ValueError instead of
+        hanging the worker; the caller treats that candidate as infeasible.
+        """
         if self._h is not None:
             self._h.run()
             status = self._h.getModelStatus()
@@ -131,7 +144,7 @@ class _IncrementalSparseLP:
                 raise ValueError('The LP dispatch optimisation failed: '
                                  f'{self._h.modelStatusToString(status)}')
             solution = self._h.getSolution()
-            duals = np.asarray(solution.row_dual) if self._rhs else np.array([])
+            duals = np.asarray(solution.row_dual) if self.n_rows else np.array([])
             return np.asarray(solution.col_value), duals
         a_ub = None
         if self._rhs:
@@ -139,8 +152,10 @@ class _IncrementalSparseLP:
             a_ub = sparse.csr_matrix(
                 (np.concatenate(self._rows_val), np.concatenate(self._rows_idx), indptr),
                 shape=(len(self._rhs), self.n))
+        options = {'time_limit': float(self.time_limit)} if self.time_limit is not None else None
         res = linprog(self.c, A_ub=a_ub, b_ub=np.asarray(self._rhs) if self._rhs else None,
-                      bounds=np.column_stack((self.lb, self.ub)), method='highs')
+                      bounds=np.column_stack((self.lb, self.ub)), method='highs',
+                      options=options)
         if not res.success:
             raise ValueError(f'The LP dispatch optimisation failed: {res.message}')
         duals = res.ineqlin.marginals if self._rhs else np.array([])
@@ -153,7 +168,8 @@ def optimise_load_profile_lp(
         objective: str = 'energy',
         temperature_threshold: float = 0.025,
         max_lp_rounds: int = 40,
-        return_shadow_prices: bool = False):
+        return_shadow_prices: bool = False,
+        time_limit: float = 600.):
     """
     This function optimises the hybrid dispatch (the split of the building load between
     the borefield and an external system) as a single linear program, which is globally
@@ -180,6 +196,10 @@ def optimise_load_profile_lp(
         True if a dictionary with the shadow prices of the binding temperature
         constraints (and the derived marginal value of borehole length) should be
         returned as a third element.
+    time_limit : float
+        Wall-clock budget for the LP solver [s]. Heavily undersized fields can
+        make the solve pathologically degenerate; on exceeding the budget a
+        ValueError is raised instead of hanging the process.
 
     Returns
     -------
@@ -276,7 +296,7 @@ def optimise_load_profile_lp(
         c = np.zeros(nvar)
         c[-2:] = 1.
 
-    lp = _IncrementalSparseLP(c, lb, ub)
+    lp = _IncrementalSparseLP(c, lb, ub, time_limit=time_limit)
     row_info = []
     added_T = set()
 
@@ -386,7 +406,10 @@ def optimise_load_profile_lp(
     marginals = duals if row_info else np.array([])
     shadow = []
     marginal_value_length = 0.
-    for i, info in enumerate(row_info):
+    # row_info can outrun the duals: constraint generation appends rows after the
+    # last successful solve when a re-solve fails (phase 2 swallows that failure
+    # and keeps the previous dispatch). Rows without a dual carry no shadow price.
+    for i, info in enumerate(row_info[:len(marginals)]):
         if info is None or abs(marginals[i]) < 1e-12:
             continue
         tau, year, sign = info
